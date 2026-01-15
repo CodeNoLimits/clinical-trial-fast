@@ -13,5 +13,8 @@ plotly>=5.22.0
 pandas>=2.2.0
 numpy>=1.26.0
 
+# Database (persistence)
+supabase>=2.0.0
+
 # Utilities
 python-dotenv>=1.0.0

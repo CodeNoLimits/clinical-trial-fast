@@ -5,6 +5,7 @@ Optimized version with:
 - Real-time progress updates
 - 2-step workflow (vs 6 steps)
 - ~60% faster screening
+- Trial history with database persistence
 """
 
 import os
@@ -12,7 +13,7 @@ import sys
 import json
 import asyncio
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from pathlib import Path
 import time
 
@@ -29,6 +30,102 @@ from dotenv import load_dotenv
 env_file = PROJECT_ROOT / ".env"
 if env_file.exists():
     load_dotenv(env_file)
+
+
+# =============================================================================
+# DATABASE - SUPABASE FOR TRIAL HISTORY PERSISTENCE
+# =============================================================================
+
+def get_supabase_client():
+    """Get Supabase client for database operations."""
+    try:
+        from supabase import create_client, Client
+
+        # Get credentials from secrets or env
+        url = None
+        key = None
+
+        try:
+            url = st.secrets.get("supabase", {}).get("url")
+            key = st.secrets.get("supabase", {}).get("key")
+        except Exception:
+            pass
+
+        if not url:
+            url = os.getenv("SUPABASE_URL")
+        if not key:
+            key = os.getenv("SUPABASE_KEY")
+
+        if url and key:
+            return create_client(url, key)
+    except Exception as e:
+        print(f"Supabase not available: {e}")
+
+    return None
+
+
+def save_trial_to_db(trial_id: str, protocol: str = None, result: dict = None):
+    """Save trial to database for history."""
+    client = get_supabase_client()
+
+    if client:
+        try:
+            data = {
+                "trial_id": trial_id,
+                "protocol_text": protocol[:5000] if protocol else None,  # Limit size
+                "screening_result": json.dumps(result) if result else None,
+                "created_at": datetime.now().isoformat()
+            }
+            client.table("trial_history").upsert(data, on_conflict="trial_id").execute()
+            return True
+        except Exception as e:
+            print(f"Error saving to DB: {e}")
+
+    # Fallback: save to session state
+    if "trial_history_local" not in st.session_state:
+        st.session_state.trial_history_local = []
+
+    # Add to local history (avoid duplicates)
+    existing_ids = [t["trial_id"] for t in st.session_state.trial_history_local]
+    if trial_id not in existing_ids:
+        st.session_state.trial_history_local.append({
+            "trial_id": trial_id,
+            "created_at": datetime.now().isoformat(),
+            "has_result": result is not None
+        })
+        # Keep only last 50
+        st.session_state.trial_history_local = st.session_state.trial_history_local[-50:]
+
+    return False
+
+
+def get_trial_history() -> List[dict]:
+    """Get trial history from database or session."""
+    client = get_supabase_client()
+
+    if client:
+        try:
+            response = client.table("trial_history").select("trial_id, created_at").order("created_at", desc=True).limit(50).execute()
+            return response.data
+        except Exception as e:
+            print(f"Error fetching history: {e}")
+
+    # Fallback: return local history
+    return st.session_state.get("trial_history_local", [])
+
+
+def get_trial_from_db(trial_id: str) -> Optional[dict]:
+    """Get specific trial data from database."""
+    client = get_supabase_client()
+
+    if client:
+        try:
+            response = client.table("trial_history").select("*").eq("trial_id", trial_id).single().execute()
+            return response.data
+        except Exception:
+            pass
+
+    return None
 
 
 # =============================================================================
@@ -136,6 +233,10 @@ if "batch_results" not in st.session_state:
     st.session_state.batch_results = []
 if "patient_validated" not in st.session_state:
     st.session_state.patient_validated = False
+if "trial_history_local" not in st.session_state:
+    st.session_state.trial_history_local = []
+if "selected_trial_id" not in st.session_state:
+    st.session_state.selected_trial_id = ""
 
 
 def clear_session():
@@ -256,6 +357,31 @@ if st.sidebar.button("Clear & New Patient", type="secondary", use_container_widt
 st.sidebar.markdown("---")
 st.sidebar.title("Trial Selection")
 
+# =============================================================================
+# TRIAL HISTORY (LEFT SIDEBAR)
+# =============================================================================
+
+trial_history = get_trial_history()
+
+if trial_history:
+    st.sidebar.subheader("Recent Trials")
+
+    # Display history as selectable buttons
+    for i, trial in enumerate(trial_history[:10]):  # Show last 10
+        trial_id_hist = trial.get("trial_id", "Unknown")
+        created = trial.get("created_at", "")[:10]  # Just date
+
+        col1, col2 = st.sidebar.columns([3, 1])
+        with col1:
+            if st.button(f"{trial_id_hist}", key=f"hist_{i}", use_container_width=True):
+                st.session_state.selected_trial_id = trial_id_hist
+                st.rerun()
+        with col2:
+            st.caption(created)
+
+    st.sidebar.markdown("---")
+
+# Trial input section
 trial_source = st.sidebar.radio(
     "Protocol Source",
     ["Enter Trial ID", "Paste Protocol"]
@@ -264,12 +390,19 @@ trial_source = st.sidebar.radio(
 trial_id = ""
 trial_protocol = ""
 
+# Use selected trial from history if available
+default_trial = st.session_state.get("selected_trial_id", "")
+
 if trial_source == "Enter Trial ID":
-    trial_id = st.sidebar.text_input("Trial ID", placeholder="NCT12345678")
+    trial_id = st.sidebar.text_input("Trial ID", value=default_trial, placeholder="NCT12345678")
     st.sidebar.info("Will use default protocol template")
 else:
-    trial_id = st.sidebar.text_input("Trial ID", placeholder="NCT12345678")
+    trial_id = st.sidebar.text_input("Trial ID", value=default_trial, placeholder="NCT12345678")
     trial_protocol = st.sidebar.text_area("Protocol Text", height=200)
+
+# Clear selected after use
+if trial_id and trial_id != default_trial:
+    st.session_state.selected_trial_id = ""
 
 
 # =============================================================================
@@ -531,6 +664,9 @@ if st.button(" Run Fast Screening", type="primary", use_container_width=True):
         if result:
             result["elapsed_time"] = f"{elapsed:.1f}s"
             st.session_state.screening_result = result
+
+            # Save trial to history (database + local)
+            save_trial_to_db(trial_id, trial_protocol, result)
 
 
 # =============================================================================
