@@ -1,0 +1,17 @@
+# Clinical Trial Fast - Optimized Dependencies
+# Minimal footprint for fast deployment
+
+# Core LLM
+langchain-google-genai>=2.0.0
+langchain-core>=0.3.0
+
+# UI
+streamlit>=1.40.0
+plotly>=5.22.0
+
+# Data
+pandas>=2.2.0
+numpy>=1.26.0
+
+# Utilities
+python-dotenv>=1.0.0
