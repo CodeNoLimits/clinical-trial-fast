@@ -132,6 +132,34 @@ if "screening_result" not in st.session_state:
     st.session_state.screening_result = None
 if "patient_data" not in st.session_state:
     st.session_state.patient_data = None
+if "batch_results" not in st.session_state:
+    st.session_state.batch_results = []
+if "patient_validated" not in st.session_state:
+    st.session_state.patient_validated = False
+
+
+def clear_session():
+    """Clear all session state for new patient."""
+    st.session_state.screening_result = None
+    st.session_state.patient_data = None
+    st.session_state.patient_validated = False
+
+
+def validate_patient_data(data: dict) -> tuple[bool, str]:
+    """Validate patient data structure (backend validation, no display)."""
+    required_fields = ["patient_id", "age", "sex"]
+
+    for field in required_fields:
+        if field not in data:
+            return False, f"Missing required field: {field}"
+
+    if not isinstance(data.get("age"), (int, float)) or data["age"] < 0:
+        return False, "Invalid age value"
+
+    if data.get("sex") not in ["male", "female", "other"]:
+        return False, "Invalid sex value"
+
+    return True, "Valid"
 
 
 # =============================================================================
@@ -219,6 +247,12 @@ st.sidebar.markdown('<span class="fast-badge">FAST MODE</span>', unsafe_allow_ht
 st.sidebar.markdown("**2-step optimized workflow**")
 st.sidebar.markdown("~60% faster than standard")
 
+# CLEAR/RESET BUTTON
+st.sidebar.markdown("---")
+if st.sidebar.button("Clear & New Patient", type="secondary", use_container_width=True):
+    clear_session()
+    st.rerun()
+
 st.sidebar.markdown("---")
 st.sidebar.title("Trial Selection")
 
@@ -256,7 +290,7 @@ st.markdown("""
 """)
 
 # Patient input tabs
-tab1, tab2 = st.tabs(["Patient Form", "JSON Input"])
+tab1, tab2, tab3 = st.tabs(["Patient Form", "JSON Input", "Batch Processing"])
 
 with tab1:
     st.header("Patient Information")
@@ -292,9 +326,15 @@ with tab1:
             "medications": [{"drug_name": medication, "dose": dose}] if medication else [],
             "lab_values": [{"test": lab_test, "value": lab_value, "unit": lab_unit}] if lab_test else []
         }
-        st.session_state.patient_data = patient_data
-        st.success("Profile built!")
-        st.json(patient_data)
+
+        # Backend validation (no JSON display to user)
+        is_valid, msg = validate_patient_data(patient_data)
+        if is_valid:
+            st.session_state.patient_data = patient_data
+            st.session_state.patient_validated = True
+            st.success(f"Patient {patient_id} loaded successfully!")
+        else:
+            st.error(f"Validation error: {msg}")
 
 
 with tab2:
@@ -309,12 +349,124 @@ with tab2:
 
     json_input = st.text_area("Patient JSON", value=json_template, height=300)
 
-    if st.button("Parse JSON", key="parse"):
+    if st.button("Load Patient", key="parse"):
         try:
-            st.session_state.patient_data = json.loads(json_input)
-            st.success("JSON parsed!")
+            parsed_data = json.loads(json_input)
+            # Backend validation (no JSON display)
+            is_valid, msg = validate_patient_data(parsed_data)
+            if is_valid:
+                st.session_state.patient_data = parsed_data
+                st.session_state.patient_validated = True
+                st.success(f"Patient {parsed_data.get('patient_id', 'N/A')} loaded successfully!")
+            else:
+                st.error(f"Validation error: {msg}")
         except json.JSONDecodeError as e:
-            st.error(f"Invalid JSON: {e}")
+            st.error(f"Invalid JSON format: {e}")
+
+
+with tab3:
+    st.header("Batch Processing")
+    st.markdown("Process multiple patients at once (up to 300+)")
+
+    batch_json = st.text_area(
+        "Patients JSON Array",
+        value='[{"patient_id": "PT001", "age": 58, "sex": "male", "diagnoses": [], "medications": [], "lab_values": []}]',
+        height=200,
+        help="Paste a JSON array of patient objects"
+    )
+
+    batch_trial_id = st.text_input("Trial ID for Batch", value="NCT12345678", key="batch_trial")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Run Batch Screening", type="primary"):
+            try:
+                patients = json.loads(batch_json)
+                if not isinstance(patients, list):
+                    st.error("Input must be a JSON array")
+                else:
+                    st.session_state.batch_results = []
+                    progress_bar = st.progress(0)
+                    status = st.empty()
+
+                    for i, patient in enumerate(patients):
+                        # Validate each patient
+                        is_valid, msg = validate_patient_data(patient)
+                        if not is_valid:
+                            st.session_state.batch_results.append({
+                                "patient_id": patient.get("patient_id", f"Patient_{i}"),
+                                "decision": "ERROR",
+                                "error": msg
+                            })
+                            continue
+
+                        status.info(f"Processing {patient.get('patient_id', f'Patient_{i}')} ({i+1}/{len(patients)})")
+                        progress_bar.progress((i + 1) / len(patients))
+
+                        # Run screening (simplified for batch)
+                        try:
+                            from src.agents.supervisor_fast import FastSupervisorAgent
+                            agent = FastSupervisorAgent()
+
+                            protocol = f"""CLINICAL TRIAL: {batch_trial_id}
+                            INCLUSION: Age 18-75, Type 2 Diabetes, HbA1c 7-10%
+                            EXCLUSION: Type 1 Diabetes, Pregnancy, Renal impairment"""
+
+                            loop = asyncio.new_event_loop()
+                            result = loop.run_until_complete(
+                                agent.screen_patient(patient, protocol, batch_trial_id)
+                            )
+                            loop.close()
+
+                            st.session_state.batch_results.append({
+                                "patient_id": patient.get("patient_id"),
+                                "decision": result.get("decision", "UNKNOWN"),
+                                "confidence": result.get("confidence", 0),
+                                "narrative": result.get("clinical_narrative", "")[:100]
+                            })
+                        except Exception as e:
+                            st.session_state.batch_results.append({
+                                "patient_id": patient.get("patient_id"),
+                                "decision": "ERROR",
+                                "error": str(e)
+                            })
+
+                    progress_bar.progress(100)
+                    status.success(f"Batch complete! {len(patients)} patients processed")
+
+            except json.JSONDecodeError as e:
+                st.error(f"Invalid JSON: {e}")
+
+    with col2:
+        if st.button("Clear Batch Results"):
+            st.session_state.batch_results = []
+            st.rerun()
+
+    # Display batch results
+    if st.session_state.batch_results:
+        st.subheader("Batch Results")
+        df = pd.DataFrame(st.session_state.batch_results)
+        st.dataframe(df, use_container_width=True)
+
+        # Summary stats
+        col1, col2, col3 = st.columns(3)
+        decisions = [r.get("decision") for r in st.session_state.batch_results]
+        with col1:
+            st.metric("Eligible", decisions.count("ELIGIBLE"))
+        with col2:
+            st.metric("Ineligible", decisions.count("INELIGIBLE"))
+        with col3:
+            st.metric("Uncertain/Error", len(decisions) - decisions.count("ELIGIBLE") - decisions.count("INELIGIBLE"))
+
+        # Export batch results
+        if st.button("Export Batch CSV"):
+            csv = df.to_csv(index=False)
+            st.download_button(
+                "Download CSV",
+                csv,
+                f"batch_screening_{batch_trial_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "text/csv"
+            )
 
 
 # =============================================================================
